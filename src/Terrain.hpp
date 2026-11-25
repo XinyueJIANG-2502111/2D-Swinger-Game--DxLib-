@@ -8,14 +8,19 @@
 #include <cstdlib>
 
 
-// 前方宣言
 class Camera;
 
-// ブロック（AABB）
+// Axis-aligned terrain block.
 struct Obstacle {
-    float x, y;          // 左上座標
+    float x, y; // Top-left world position.
     float width, height;
     unsigned int color;
+
+    // Procedural blocks unload with their owner chunk.
+    int ownerChunkX = 0;
+    int ownerChunkY = 0;
+    // Persistent blocks survive chunk unloading.
+    bool isPersistent = false;
 
     float Left() const { return x; }
     float Right() const { return x + width; }
@@ -23,38 +28,41 @@ struct Obstacle {
     float Bottom() const { return y + height; }
 };
 
-// 当たり判定用
+// First intersection along the ray.
 struct RaycastResult {
-    bool hit;           // 当たっているかどうか
-    Vector2 hitPoint;   // 当たった場所の座標
-    float t;            // 時間
+    bool hit;
+    Vector2 hitPoint;
+    float t; // Distance along a normalized ray.
 };
 
-// 当たった時の情報
+// Circle against terrain contact.
 struct CollisionResult {
     bool collided;
-    Vector2 pushVector; // プレイヤーを押し出す
-    Vector2 normal;     // 法線ベクトル
+    Vector2 pushVector; // Displacement needed to clear the block.
+    Vector2 normal; // Outward contact normal.
 };
 
-// アイテム
+// Collectible core.
 struct CoreItem {
-    float x, y;          // 中心点座標
-    float radius;        // 半径
+    float x, y; // Center in world coordinates.
+    float radius;
     unsigned int color;
     bool isCollected;
-    float pulseTimer;    // アニメーション用
+    float pulseTimer; // Phase of the pulse animation.
+
+    // A core unloads with the chunk that spawned it.
+    int ownerChunkX = 0;
+    int ownerChunkY = 0;
 };
 
-// エフェクト用
 struct EffectParticle {
-    Vector2 pos;       // 座標
-    Vector2 velocity;  // 移動方向
-    float alpha;       // 不透明度
+    Vector2 pos;
+    Vector2 velocity;
+    float alpha;
     unsigned int color;
 };
 
-// 当たり判定（ワイヤーがブロックに当たっているかどうか）
+// Intersect the ray with the block on both axes.
 inline RaycastResult RaycastToObstacle(const Vector2& rayStart, const Vector2& rayDir, float maxDist, const Obstacle& obs) {
     RaycastResult result = { false, {0,0}, maxDist };
 
@@ -66,6 +74,7 @@ inline RaycastResult RaycastToObstacle(const Vector2& rayStart, const Vector2& r
     float tYMax = (obs.Bottom() - rayStart.y) / rayDir.y;
     if (tYMin > tYMax) std::swap(tYMin, tYMax);
 
+    // The ray must be inside both axis ranges at the same point.
     if (tXMin > tYMax || tYMin > tXMax) return result;
 
     float tNear = (std::max)(tXMin, tYMin);
@@ -81,10 +90,11 @@ inline RaycastResult RaycastToObstacle(const Vector2& rayStart, const Vector2& r
     return result;
 }
 
-// プレイヤーの当たり判定
+// Test a circular player against an axis-aligned block.
 inline CollisionResult CheckPlayerCollision(const Vector2& playerPos, float radius, const Obstacle& obs) {
     CollisionResult result = { false, {0,0}, {0,0} };
 
+    // Clamp the center to the block to find its closest point.
     float closestX = (std::max)(obs.Left(), (std::min)(playerPos.x, obs.Right()));
     float closestY = (std::max)(obs.Top(), (std::min)(playerPos.y, obs.Bottom()));
 
@@ -98,6 +108,7 @@ inline CollisionResult CheckPlayerCollision(const Vector2& playerPos, float radi
         result.pushVector = result.normal * overlap;
     }
     else if (distance == 0.0f) {
+        // If the center is inside or on the block, push the circle out through the nearest edge.
         result.collided = true;
         float dl = playerPos.x - obs.Left();
         float dr = obs.Right() - playerPos.x;
@@ -116,12 +127,10 @@ inline CollisionResult CheckPlayerCollision(const Vector2& playerPos, float radi
 
 
 
-// マップを管理するクラス
 class TerrainManager {
 public:
-    const float CHUNK_SIZE = 400.0f; // ゾーン範囲
+    const float CHUNK_SIZE = 400.0f; // Chunk width and height in pixels.
 
-    // ロード済のゾーン
     std::set<std::pair<int, int>> loadedChunks;
 
 public:
@@ -131,23 +140,22 @@ public:
     float lastGeneratedX = 300.0f;
     const float CHUNK_WIDTH = 400.0f;
 
-    // エフェクト用
     std::vector<EffectParticle> particles;
 
-    // エフェクトを生成
     void SpawnExplosion(Vector2 spawnPos, unsigned int coreColor);
 
-    // 初期化
     void Init();
 
-    // 周りのマップをロードする
+    // Load nearby chunks and unload distant ones.
     void UpdateAllDirections(Vector2 cameraPos);
 
 private:
-    // ブロック生成
+    // Unload farther away to avoid repeated loading at chunk borders.
+    static constexpr int LOAD_RADIUS = 2;
+    static constexpr int UNLOAD_RADIUS = 4;
+
     void GenerateChunk(int cx, int cy);
 
 public:
-    // 描画
     void Draw(const Camera& camera);
 };

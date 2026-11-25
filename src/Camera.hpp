@@ -1,17 +1,15 @@
 ﻿#pragma once
 #include "Vector.hpp"
 
-// カメラクラス
 class Camera {
 public:
-    Vector2 position{ 400.0f, 300.0f }; // カメラ位置
+    Vector2 position{ 400.0f, 300.0f }; // Viewport center in world coordinates.
 
-    // 初期化
     void Init() {
         position = Vector2{ 400.0f, 300.0f };
     }
 
-    // 座標変換
+    // Map world coordinates to screen pixels.
     Vector2 WorldToScreen(const Vector2& worldPos) const {
         return {
             worldPos.x - position.x + 400.0f,
@@ -19,9 +17,9 @@ public:
         };
     }
 
-    // プレイヤーを追従する（線形補間使用）
+    // Ease the camera toward its follow target.
     void Follow(const Vector2& playerWorldPos, float dt) {
-        // すこし上にずれる
+        // Show more of the area above the player.
         float targetX = playerWorldPos.x;
         float targetY = playerWorldPos.y - 80.0f;
 

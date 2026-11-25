@@ -8,12 +8,33 @@
 #include <cmath>
 #include <vector>
 
+void Player::Reset(const Vector2& spawnPosition) {
+    position = spawnPosition;
+    velocity = { 0.0f, 0.0f };
+    isGrounded = false;
+
+    ReleaseGrapple();
+    anchorPoint = { 0.0f, 0.0f };
+    ropeLength = 0.0f;
+    targetRopeLength = 0.0f;
+    hookCurrentPos = { 0.0f, 0.0f };
+    hookVelocity = { 0.0f, 0.0f };
+    currentFlyDist = 0.0f;
+
+    trail.clear();
+    wasInWater = false;
+    noInputWaterTimer = 0.0f;
+    isDead = false;
+    buoyancyScale = 1.0f;
+}
+
 bool Player::IsInWater() const {
-    return position.y >= waterLineY;
+    // Water entry starts when the bottom of the player touches the surface.
+    return position.y + collisionRadius >= waterLineY;
 }
 
 void Player::LaunchGrapple(Vector2 mouseWorldPos, const TerrainManager& terrain) {
-    if (grappleState != GrappleState::None) return; // 重複発射防止
+    if (grappleState != GrappleState::None) return; // Only one hook can be active.
 
     Vector2 toMouse = mouseWorldPos - position;
     float distToMouse = toMouse.Length();
@@ -24,12 +45,12 @@ void Player::LaunchGrapple(Vector2 mouseWorldPos, const TerrainManager& terrain)
     grappleState = GrappleState::Flying;
     isGrappling = false;
 
-    hookCurrentPos = position; // 開始位置
+    hookCurrentPos = position;
     hookVelocity = rayDir * hookFlySpeed;
-    currentFlyDist = 0.0f; // 距離リセット
+    currentFlyDist = 0.0f;
     anchorPoint = hookCurrentPos;
 
-    // 移動軌跡（エフェクト）
+    // Leave a trail mark when the hook fires.
     trail.push_back({ position, 1.5f });
 }
 
@@ -49,38 +70,98 @@ void Player::Jump() {
     }
 }
 
+void Player::MoveAndCollide(float dt, const TerrainManager& terrain) {
+    // Split fast movement into steps to reduce tunneling.
+    const float maxStepDistance = collisionRadius * 0.5f;
+    const float travelDistance = velocity.Length() * dt;
+    int substepCount = static_cast<int>(std::ceil(travelDistance / maxStepDistance));
+    if (substepCount < 1) substepCount = 1;
+
+    // Cap the work per frame at extreme speeds.
+    const int maxSubstepCount = 128;
+    if (substepCount > maxSubstepCount) substepCount = maxSubstepCount;
+
+    const float substepDt = dt / static_cast<float>(substepCount);
+    isGrounded = false;
+
+    for (int step = 0; step < substepCount; ++step) {
+        position += velocity * substepDt;
+
+        // Use up to two passes to resolve corners and multiple contacts.
+        for (int iteration = 0; iteration < 2; ++iteration) {
+            bool resolvedAnyCollision = false;
+
+            for (const auto& obs : terrain.obstacles) {
+                CollisionResult col = CheckPlayerCollision(position, collisionRadius, obs);
+                if (!col.collided) continue;
+
+                resolvedAnyCollision = true;
+                position += col.pushVector;
+
+                const bool landedOnTop = col.normal.y < -0.7f;
+                if (landedOnTop) {
+                    isGrounded = true;
+                    if (velocity.y > 0.0f) velocity.y = 0.0f;
+                }
+
+                const float velocityAlongNormal = velocity.Dot(col.normal);
+                if (velocityAlongNormal < 0.0f) {
+                    // Give walls and ceilings a small bounce. Stop on floors.
+                    const float bounce = landedOnTop ? 0.0f : 0.15f;
+                    velocity -= col.normal * (1.0f + bounce) * velocityAlongNormal;
+
+                    if (col.normal.y != 0.0f) velocity.x *= 0.98f;
+                    if (col.normal.x != 0.0f) velocity.y *= 0.95f;
+                }
+            }
+
+            if (!resolvedAnyCollision) break;
+        }
+    }
+
+    RefreshGroundedState(terrain);
+}
+
+void Player::RefreshGroundedState(const TerrainManager& terrain) {
+    // Probe below the player to detect contact without overlap.
+    const float groundProbeDistance = 1.0f;
+    const Vector2 probePosition = position + Vector2{ 0.0f, groundProbeDistance };
+
+    for (const auto& obs : terrain.obstacles) {
+        const CollisionResult col = CheckPlayerCollision(probePosition, collisionRadius, obs);
+        if (col.collided && col.normal.y < -0.7f) {
+            isGrounded = true;
+            return;
+        }
+    }
+}
+
 void Player::Update(float dt, int horizontalInput, int verticalInput, bool jumpInput, bool reelInput, Water& water, float cameraLeft, const TerrainManager& terrain) {
-    // ゲームオーバー
+    // Let the player sink after drowning.
     if (isDead) {
-        // 完全に沈む
         const float deathGravity = 400.0f;
         velocity.y += deathGravity * dt;
         position += velocity * dt;
         const float SEA_BOTTOM_Y = 2000.0f;
 
-        // 境界条件
+        // Stop the body at the sea floor.
         if (position.y + 8.f > SEA_BOTTOM_Y) {
             position.y = SEA_BOTTOM_Y - 8.f;
         }
 
-        // エフェクト
         water.EmitBlood(position, 2);
         return;
     }
 
-    // ========================================================
-    // 　Hook Point
-    // ========================================================
+    // Advance the flying hook and check for hits along its path.
     if (grappleState == GrappleState::Flying) {
-        // 直前の位置
         Vector2 prevHookPos = hookCurrentPos;
 
-        // 発射
         Vector2 stepMove = hookVelocity * dt;
         hookCurrentPos += stepMove;
         currentFlyDist += stepMove.Length();
 
-        // 当たり判定
+        // Keep the earliest hit in the current frame.
         bool hasHit = false;
         RaycastResult closestResult;
         closestResult.hit = false;
@@ -91,7 +172,6 @@ void Player::Update(float dt, int horizontalInput, int verticalInput, bool jumpI
         float stepLen = stepMove.Length();
 
         for (const auto& obs : terrain.obstacles) {
-            // 当たり判定
             RaycastResult res = RaycastToObstacle(prevHookPos, stepDir, stepLen, obs);
             if (res.hit) {
                 float tFraction = (stepLen > 0.0001f) ? (res.t / stepLen) : 0.0f;
@@ -102,7 +182,7 @@ void Player::Update(float dt, int horizontalInput, int verticalInput, bool jumpI
                 }
             }
 
-            // ブロック内部であるかどうか
+            // If the tip ends inside a block, try snapping it to the crossed edge.
             bool pointInside = (hookCurrentPos.x >= obs.Left() && hookCurrentPos.x <= obs.Right() &&
                 hookCurrentPos.y >= obs.Top() && hookCurrentPos.y <= obs.Bottom());
             if (pointInside) {
@@ -131,7 +211,7 @@ void Player::Update(float dt, int horizontalInput, int verticalInput, bool jumpI
 
         
         if (hasHit) {
-            // 目標位置にくっつく
+            // Pin the hook and start the rope at its current length.
             grappleState = GrappleState::Pinned;
             isGrappling = true;
             hookCurrentPos = closestResult.hitPoint;
@@ -141,6 +221,7 @@ void Player::Update(float dt, int horizontalInput, int verticalInput, bool jumpI
             float actualDistance = toAnchor.Length();
             Vector2 pullDir = toAnchor.Normalized();
 
+            // Redirect existing speed toward the anchor near the water surface.
             if (IsInWater() || position.y >= waterLineY - 30.0f) {
                 float speed = velocity.Length();
                 if (speed > 600.0f) speed = 600.0f;
@@ -157,20 +238,63 @@ void Player::Update(float dt, int horizontalInput, int verticalInput, bool jumpI
             targetRopeLength = actualDistance;
         }
         else if (currentFlyDist >= MAX_GRAPPLE_RANGE) {
-            // 最大距離を超えた
             grappleState = GrappleState::None;
             isGrappling = false;
         }
     }
 
-    // ===========================================================================================
     velocity.y += gravity * dt;
-    isGrounded = false;
 
-    bool hasInput = (horizontalInput != 0) || (verticalInput != 0) || jumpInput || reelInput || isGrappling;
-    bool currentInWater = IsInWater();
+    const bool hasInput = (horizontalInput != 0) || (verticalInput != 0) || jumpInput || reelInput;
+    const bool currentInWater = IsInWater();
 
-    // プレイヤーの状態
+    // Splash only when entering water while moving down.
+    if (currentInWater && !wasInWater && velocity.y > 0.0f) {
+        water.Splash(position.x, velocity.y, cameraLeft);
+    }
+
+    // Input or leaving the water restores full buoyancy.
+    if (!currentInWater || hasInput) {
+        noInputWaterTimer = 0.0f;
+        buoyancyScale = 1.0f;
+    }
+    else {
+        noInputWaterTimer += dt;
+
+        if (noInputWaterTimer < buoyancyFadeStartTime) {
+            buoyancyScale = 1.0f;
+        }
+        else if (noInputWaterTimer < drowningTime) {
+            // Fade buoyancy linearly until the drowning time.
+            const float fadeDuration = drowningTime - buoyancyFadeStartTime;
+            const float fadeProgress = (noInputWaterTimer - buoyancyFadeStartTime) / fadeDuration;
+            buoyancyScale = 1.0f - fadeProgress;
+
+            if (rand() % 10 == 0) {
+                water.EmitBlood(position, 1);
+            }
+        }
+        else {
+            isDead = true;
+            velocity = { 0.0f, 60.0f };
+            water.EmitBlood(position, 80);
+            return;
+        }
+    }
+
+    if (currentInWater) {
+        // Scale buoyancy by the submerged share of the player diameter.
+        float submergedDepth = position.y + collisionRadius - waterLineY;
+        const float playerDiameter = collisionRadius * 2.0f;
+        if (submergedDepth < 0.0f) submergedDepth = 0.0f;
+        if (submergedDepth > playerDiameter) submergedDepth = playerDiameter;
+
+        const float submergedRatio = submergedDepth / playerDiameter;
+        const float currentBuoyancy = submergedRatio * buoyancyEngine * buoyancyScale;
+        velocity.y -= currentBuoyancy * dt;
+    }
+
+    // Adjust the rope toward the requested length while attached.
     if (isGrappling) {
         if (ropeLength > targetRopeLength) {
             ropeLength -= autoPullSpeed * dt;
@@ -206,9 +330,11 @@ void Player::Update(float dt, int horizontalInput, int verticalInput, bool jumpI
         float currentDist = toPlayer.Length();
         Vector2 ropeDir = toPlayer.Normalized();
 
+        // Apply swing input tangent to the rope.
         Vector2 tangentDir = { ropeDir.y, -ropeDir.x };
         velocity += tangentDir * (static_cast<float>(horizontalInput) * swingForce * dt);
 
+        // Pull the player within reach and remove outward speed when the rope is taut.
         if (currentDist >= ropeLength) {
             float vRope = velocity.Dot(ropeDir);
             if (vRope > 0.0f) {
@@ -226,62 +352,12 @@ void Player::Update(float dt, int horizontalInput, int verticalInput, bool jumpI
     }
     else {
         if (currentInWater) {
-            if (!wasInWater && velocity.y > 0.0f) {
-                water.Splash(position.x, velocity.y, cameraLeft);
-            }
-
-            // 水面にいる時
-            // 着地瞬間（エフェクトを出す）
-            if (!wasInWater && velocity.y > 0.0f) {
-                water.Splash(position.x, velocity.y, cameraLeft);
-            }
-
-            // 長い間（１０秒間）に入力がないとゲームオーバー
-            if (!hasInput) {
-                noInputWaterTimer += dt;
-
-                if (noInputWaterTimer < 5.f) {
-                    // 五秒以内：普段通り
-                    buoyancyScale = 1.0f;
-                }
-                else if (noInputWaterTimer >= 5.f && noInputWaterTimer < 10.f) {
-                    // 十秒以内：すこし沈む
-                    float progress = (noInputWaterTimer - 0.5f) / 1.0f;
-                    buoyancyScale = 1.0f - progress + 0.0001f;
-
-                    // エフェクト（小）
-                    if (rand() % 10 == 0) {
-                        water.EmitBlood(position, 1);
-                    }
-                }
-                else if (noInputWaterTimer >= 10.f) {
-                    // 十秒超えた：完全に沈む、ゲームオーバー
-                    isDead = true;
-                    velocity = { 0.0f, 60.0f };
-                    water.EmitBlood(position, 80); // エフェクト（大）
-                    return;
-                }
-            }
-            else {
-                // リセット
-                noInputWaterTimer = 0.0f;
-            }
-
-            // 流体シミュレーション
+            // Apply drag proportional to the square of each speed component.
             velocity.x -= velocity.x * std::abs(velocity.x) * 0.002f * waterDensity * dt;
             velocity.y -= velocity.y * std::abs(velocity.y) * 0.005f * waterDensity * dt;
 
             velocity *= (1.0f - 2.0f * dt);
 
-            float depth = position.y - waterLineY;
-            if (depth < 0.0f) depth = 0.0f;
-
-            float currentBuoyancy = (depth / 30.0f) * buoyancyEngine * buoyancyScale;
-            if (currentBuoyancy > buoyancyEngine) currentBuoyancy = buoyancyEngine;
-
-            velocity.y -= currentBuoyancy * dt;
-
-            // 移動
             if (horizontalInput != 0) {
                 velocity.x += static_cast<float>(horizontalInput) * groundAcc * dt;
             }
@@ -295,48 +371,9 @@ void Player::Update(float dt, int horizontalInput, int verticalInput, bool jumpI
         }
     }
 
-    if (!isDead) {
-        const float PLAYER_RADIUS = 16.0f; // 半径
+    MoveAndCollide(dt, terrain);
 
-        // 当たり判定
-        // 二回ループ：より安定的な結果
-        for (int iteration = 0; iteration < 2; iteration++) {
-            for (const auto& obs : terrain.obstacles) {
-                CollisionResult col = CheckPlayerCollision(position, PLAYER_RADIUS, obs);
-
-                if (col.collided) {
-                    // 位置変更（ブロック内部にいないように）
-                    position += col.pushVector;
-
-                    // ブロックの上にいる
-                    if (col.normal.y < -0.7f) {
-                        isGrounded = true;
-
-                        if (velocity.y > 0.0f) {
-                            velocity.y = 0.0f;
-                        }
-                    }
-
-                    // 衝突後の速度再計算
-                    float velAlongNormal = velocity.x * col.normal.x + velocity.y * col.normal.y;
-
-                    if (velAlongNormal < 0.0f) {
-                        const float bounce = 0.15f;
-
-                        velocity -= col.normal * (1.0f + bounce) * velAlongNormal;
-
-                        if (col.normal.y != 0.0f) velocity.x *= 0.98f;
-                        if (col.normal.x != 0.0f) velocity.y *= 0.95f;
-                    }
-                }
-            }
-        }
-    }
-
-    // 位置更新
-    position += velocity * dt;
-
-    // 境界条件
+    // Limit how deep a living player can sink.
     if (position.y > 650.0f) {
         position.y = 650.0f;
         if (velocity.y > 0.0f) velocity.y = 0.0f;
@@ -346,7 +383,7 @@ void Player::Update(float dt, int horizontalInput, int verticalInput, bool jumpI
 
     wasInWater = currentInWater;
 
-    // 移動の時のエフェクト
+    // Leave a trail at high speed and fade older marks.
     if (velocity.Length() > 150.0f) {
         trail.push_back({ position, 1.0f });
     }
@@ -362,22 +399,19 @@ void Player::Update(float dt, int horizontalInput, int verticalInput, bool jumpI
 }
 
 void Player::Draw(const Camera& camera, const Vector2& mouseWorldPos, const TerrainManager& terrain) {
-    // ========================================================
-    // ワイヤー発射前のガイド：発射方向を示す
-    // ========================================================
+    // Preview the nearest reachable anchor in the aim direction.
     if (!isDead && !isGrappling) {
         Vector2 toMouse = mouseWorldPos - position;
         float distToMouse = toMouse.Length();
 
         if (distToMouse > 10.0f) {
             Vector2 rayDir = toMouse.Normalized();
-            const float MAX_GRAPPLE_RANGE = 600.0f; // 最大距離と一致
+            const float MAX_GRAPPLE_RANGE = 600.0f; // Match the hook range.
 
             bool foundClosestHit = false;
             RaycastResult closestResult;
             closestResult.t = MAX_GRAPPLE_RANGE;
 
-            // 周りのブロックを探す
             for (const auto& obs : terrain.obstacles) {
                 RaycastResult res = RaycastToObstacle(position, rayDir, MAX_GRAPPLE_RANGE, obs);
                 if (res.hit && res.t < closestResult.t) {
@@ -398,8 +432,7 @@ void Player::Draw(const Camera& camera, const Vector2& mouseWorldPos, const Terr
 
             const float dotStep = 15.0f;
 
-            // その方向にブロックがあるかどうか
-            // ある：青色の点線 | ない（または範囲外）：灰色の点線
+            // Teal marks a reachable anchor. Gray marks empty space.
             unsigned int lineColor = foundClosestHit ? GetColor(0, 255, 200) : GetColor(120, 120, 120);
 
             SetDrawBlendMode(DX_BLENDMODE_ALPHA, foundClosestHit ? 180 : 80);
@@ -423,9 +456,7 @@ void Player::Draw(const Camera& camera, const Vector2& mouseWorldPos, const Terr
         }
     }
 
-    // ========================================================
-    // // 移動の時のエフェクト
-    // ========================================================
+    // Draw the fading movement trail.
     for (const auto& t : trail) {
         Vector2 sTrailPos = camera.WorldToScreen(t.pos);
 
@@ -435,9 +466,7 @@ void Player::Draw(const Camera& camera, const Vector2& mouseWorldPos, const Terr
     }
     SetDrawBlendMode(DX_BLENDMODE_NOBLEND, 0);
 
-    // ========================================================
-    // ワイヤーの描画
-    // ========================================================
+    // Draw the rope to the moving tip or fixed anchor.
     if (grappleState == GrappleState::Flying || grappleState == GrappleState::Pinned) {
         Vector2 sPlayerPos = camera.WorldToScreen(position);
 
@@ -456,10 +485,9 @@ void Player::Draw(const Camera& camera, const Vector2& mouseWorldPos, const Terr
 
         DrawLine(aX, aY, pX, pY, GetColor(255, 255, 255), 2);
 
-        // 飛行中のヘッド
         if (grappleState == GrappleState::Flying) {
-            // Flying hook head: distinctive neon glow effect (overlapping translucent circles)
-            unsigned int glowColor = GetColor(0, 230, 255); // Ice blue glow
+            // Layer translucent circles for the flying tip glow.
+            unsigned int glowColor = GetColor(0, 230, 255);
             SetDrawBlendMode(DX_BLENDMODE_ALPHA, 50);
             DrawCircle(aX, aY, 14, glowColor, TRUE);
             SetDrawBlendMode(DX_BLENDMODE_ALPHA, 100);
@@ -467,11 +495,11 @@ void Player::Draw(const Camera& camera, const Vector2& mouseWorldPos, const Terr
             SetDrawBlendMode(DX_BLENDMODE_ALPHA, 180);
             DrawCircle(aX, aY, 4, glowColor, TRUE);
             SetDrawBlendMode(DX_BLENDMODE_NOBLEND, 0);
-            DrawCircle(aX, aY, 2, GetColor(255, 255, 255), TRUE); // Central bright white dot
+            DrawCircle(aX, aY, 2, GetColor(255, 255, 255), TRUE);
         }
         else {
-            // Pinned hook head: red/neon green anchor point
-            unsigned int pinColor = GetColor(255, 50, 50); // Red core
+            // Mark the fixed anchor in red.
+            unsigned int pinColor = GetColor(255, 50, 50);
             SetDrawBlendMode(DX_BLENDMODE_ALPHA, 100);
             DrawCircle(aX, aY, 10, pinColor, TRUE);
             SetDrawBlendMode(DX_BLENDMODE_NOBLEND, 0);
@@ -480,9 +508,7 @@ void Player::Draw(const Camera& camera, const Vector2& mouseWorldPos, const Terr
         }
     }
 
-    // ========================================================
-    // プレイヤーを描画
-    // ========================================================
+    // Draw the player.
     Vector2 sPlayerPos = camera.WorldToScreen(position);
     int pX = static_cast<int>(sPlayerPos.x);
     int pY = static_cast<int>(sPlayerPos.y);

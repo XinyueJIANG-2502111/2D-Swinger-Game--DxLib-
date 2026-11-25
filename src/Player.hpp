@@ -4,25 +4,22 @@
 
 #include <vector>
 
-// 前方宣言
 class TerrainManager;
 class Water;
 class Camera;
 
-// エフェクト用（移動時）
+// A fading mark left by the moving player.
 struct TrailPoint {
     Vector2 pos;
     float alpha;
 };
 
-// プレイヤークラス
 class Player {
 public:
-    // 位置と速度
     Vector2 position{ 400.0f, 500.0f };
     Vector2 velocity{ 0.0f, 0.0f };
 
-    // 物理演算関連
+    // Movement and grapple tuning.
     const float gravity = 750.0f;
     const float drag = 0.3f;
     const float swingForce = 600.0f;
@@ -32,6 +29,9 @@ public:
     const float airControlForce = 400.0f;
 
     bool isGrounded = false;
+
+    // Use this radius for collisions, water entry, and submerged depth.
+    const float collisionRadius = 16.0f;
     const float jumpForce = 500.0f;
 
     const float grappleJumpBonus = 350.0f;
@@ -40,60 +40,67 @@ public:
     const float autoPullSpeed = 500.0f;
     float targetRopeLength = 0.0f;
 
-    // 水
-    const float waterLineY = 550.0f;      // 水面高さ
-    const float waterDensity = 4.5f;      // 密度（抵抗係数）
+    // Water physics.
+    const float waterLineY = 550.0f;
+    const float waterDensity = 4.5f; // Water drag coefficient.
     const float buoyancyEngine = 1800.0f;
 
+    // Times in seconds spent in water without input.
+    const float buoyancyFadeStartTime = 5.0f;
+    const float drowningTime = 10.0f;
+
+    // True while the hook is pinned.
     bool isGrappling = false;
     Vector2 anchorPoint{ 0.0f, 0.0f };
     float ropeLength = 0.0f;
 
-    // エフェクト用
+    // Movement trail and water entry state.
     std::vector<TrailPoint> trail;
     bool wasInWater = false;
 
-    // ゲームオーバー判定用
+    // Drowning state.
     float noInputWaterTimer = 0.0f;
     bool isDead = false;
     float buoyancyScale = 1.0f;
 
-    // ワイヤー関連
-    // 状態
     enum class GrappleState {
-        None,       // なにもくっついていない（発射していない）
-        Flying,     // 発射途中
-        Pinned      // ブロックにくっついている
+        None, // Hook is inactive.
+        Flying, // Hook is in flight.
+        Pinned // Hook is attached to terrain.
     };
 
-    // 初期化
     GrappleState grappleState = GrappleState::None;
 
-    Vector2 hookCurrentPos{ 0.0f, 0.0f };   // ワイヤーヘッドの位置
-    Vector2 hookVelocity{ 0.0f, 0.0f };     // 速度（方向）
-    const float hookFlySpeed = 2200.0f;     // 速度（大きさ）
-    float currentFlyDist = 0.0f;            // 飛行した距離
-    const float MAX_GRAPPLE_RANGE = 600.0f; // 最大飛行距離
+    Vector2 hookCurrentPos{ 0.0f, 0.0f };
+    Vector2 hookVelocity{ 0.0f, 0.0f };
+    const float hookFlySpeed = 2200.0f;
+    float currentFlyDist = 0.0f; // Distance traveled by the flying hook.
+    const float MAX_GRAPPLE_RANGE = 600.0f;
 
 
 public:
-    // プレイヤーが水にいるかどうか
+    // Reset movement, grapple, effects, and drowning state for a new spawn.
+    void Reset(const Vector2& spawnPosition);
+
+    // Check if the bottom of the player reaches the waterline.
     bool IsInWater() const;
 
-    // ワイヤーを発射する
     void LaunchGrapple(Vector2 mouseWorldPos, const TerrainManager& terrain);
 
-    // ワイヤーを切る
     void ReleaseGrapple();
 
-    // ジャンプ
     void Jump();
 
-    // 更新
     void Update(float dt, 
         int horizontalInput, int verticalInput, bool jumpInput, bool reelInput, 
         Water& water, float cameraLeft, const TerrainManager& terrain);
 
-    // 描画
     void Draw(const Camera& camera, const Vector2& mouseWorldPos, const TerrainManager& terrain);
+
+private:
+    // Move in substeps and resolve collisions after each step.
+    void MoveAndCollide(float dt, const TerrainManager& terrain);
+
+    // Probe below the player to detect resting contact.
+    void RefreshGroundedState(const TerrainManager& terrain);
 };

@@ -1,51 +1,49 @@
-#include "DxLib.h"
+﻿#include "DxLib.h"
 #include "Vector.hpp"
 #include "Camera.hpp"
 #include "Player.hpp"
 #include "Water.hpp"
 #include "Terrain.hpp"
+#include "ControlsGuide.hpp"
+#include "HudPanel.hpp"
 #include <cmath>
 #include <vector>
 
-int playerScore = 0;                         // スコア
-const float PLAYER_COLLISION_RADIUS = 16.0f; // プレイヤーの半径
+int playerScore = 0;
+const float PLAYER_COLLISION_RADIUS = 16.0f;
 
-// ==========================================
-//  main function
-// ==========================================
 int WINAPI WinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, _In_ LPSTR lpCmdLine, _In_ int nCmdShow) {
-    // DxLib の基本設定
-    ChangeWindowMode(TRUE);          // ウィンドウモード
-    SetGraphMode(800, 600, 32);      // 解像度（画面サイズ）
+    // Set up the DxLib window.
+    ChangeWindowMode(TRUE);
+    SetGraphMode(800, 600, 32);
     SetWindowText("test");
 
     if (DxLib_Init() == -1) return -1;
+    // Draw to the back buffer before presenting the frame.
     SetDrawScreen(DX_SCREEN_BACK);
 
-    // ゲームに必要なオブジェクト
     Player player;
     Water water;
     Camera camera;
     TerrainManager terrain;
+    ControlsGuide controlsGuide;
 
-    // 初期化
-    player.position = { 400.0f, 400.0f };
+    player.Reset({ 400.0f, 400.0f });
     terrain.Init();
 
-    // DeltaTime
     LONGLONG prevTime = GetNowHiPerformanceCount();
 
-    // main loop
     while (ProcessMessage() == 0 && ClearDrawScreen() == 0) {
-        // DeltaTime
+        // Convert the timer from microseconds to seconds.
         LONGLONG currTime = GetNowHiPerformanceCount();
         float dt = static_cast<float>(currTime - prevTime) / 1000000.0f;
         prevTime = currTime;
+        // Cap long frames to keep physics steps stable.
         if (dt > 0.05f) dt = 0.05f;
 
-        // ==========================================================================================================
-        // プレイヤー入力
-        // ==========================================================================================================
+        // Read player controls.
+        controlsGuide.Update(CheckHitKey(KEY_INPUT_TAB) > 0);
+
         int horizontalInput = 0;
         if (CheckHitKey(KEY_INPUT_A) || CheckHitKey(KEY_INPUT_LEFT))  horizontalInput = -1;
         if (CheckHitKey(KEY_INPUT_D) || CheckHitKey(KEY_INPUT_RIGHT)) horizontalInput = 1;
@@ -53,7 +51,6 @@ int WINAPI WinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, _
         int verticalInput = 0;
         if (CheckHitKey(KEY_INPUT_S) || CheckHitKey(KEY_INPUT_DOWN)) verticalInput = 1;
 
-        // ジャンプ
         bool jumpInput = false;
         if (CheckHitKey(KEY_INPUT_SPACE)) {
             jumpInput = true;
@@ -62,106 +59,85 @@ int WINAPI WinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, _
 
         bool reelInput = (CheckHitKey(KEY_INPUT_W) || CheckHitKey(KEY_INPUT_UP));
 
-        // マウス位置を取得
         int mouseX, mouseY;
         GetMousePoint(&mouseX, &mouseY);
 
-        // 座標変換
+        // Undo the camera offset to aim in world coordinates.
         Vector2 mouseWorldPos = {
             static_cast<float>(mouseX) + camera.position.x - 400.0f,
             static_cast<float>(mouseY) + camera.position.y - 300.0f
         };
 
-        // 左クリック：ワイヤーを発射する
+        // Left click fires the hook and counts as player activity.
         if ((GetMouseInput() & MOUSE_INPUT_LEFT) != 0) {
             jumpInput = true;
 
-            // なにもくっついていない場合
             if (player.grappleState == Player::GrappleState::None) {
                 player.LaunchGrapple(mouseWorldPos, terrain);
             }
         }
 
-        // 右クリック：
+        // Right click releases the hook.
         if ((GetMouseInput() & MOUSE_INPUT_RIGHT) != 0) {
             player.ReleaseGrapple();
         }
 
-        // ==========================================================================================================
-        // ゲームオーバー
-        // ==========================================================================================================
-        //  Rを押してリセット
+        // R restarts the game after drowning.
         if (player.isDead && CheckHitKey(KEY_INPUT_R)) {
-            player.isDead = false;
-            player.noInputWaterTimer = 0.f;
-            player.buoyancyScale = 1.f;
+            // Reset the player, water, camera, terrain, and score.
+            player.Reset({ 400.0f, 300.0f });
+            water.Reset();
             playerScore = 0;
-            player.position = { 400.0f, 300.0f };
-            player.velocity = { 0.0f, 0.0f };
-            player.ReleaseGrapple();
             camera.Init();
             terrain.Init();
-            terrain.UpdateAllDirections(camera.position);
         }
 
-        // Escを押して終了
+        // Esc exits from the game-over screen.
         if (player.isDead && CheckHitKey(KEY_INPUT_ESCAPE)) {
             break;
         }
 
-        // マップを更新する
+        // Stream terrain around the camera.
         terrain.UpdateAllDirections(camera.position);
 
-        // ==========================================================================================================
-        // アイテム獲得判定
-        // ==========================================================================================================
+        // Collect cores when their circles overlap the player.
         if (!player.isDead) {
             for (auto& core : terrain.cores) {
                 if (core.isCollected) continue;
 
-                // プレイヤーとアイテムの距離（中心点）
                 float dx = player.position.x - core.x;
                 float dy = player.position.y - core.y;
                 float distance = std::sqrt(dx * dx + dy * dy);
 
-                // 当たり判定
                 if (distance < (PLAYER_COLLISION_RADIUS + core.radius)) {
 
-                    // 当たった
                     core.isCollected = true;
                     playerScore += 1;
 
-                    // エフェクトを再生する
                     terrain.SpawnExplosion({ core.x, core.y }, core.color);
                     player.trail.push_back({ player.position, 2.0f });
                 }
             }
         }
 
-        // ==========================================================================================================
-        // 更新
-        // ==========================================================================================================
+        // Update the player before moving the camera.
         water.Update(dt);
         float cameraLeft = camera.position.x - 400.0f;
         player.Update(dt, horizontalInput,verticalInput, jumpInput, reelInput, water, cameraLeft, terrain);
         camera.Follow(player.position, dt);
 
-        // ==========================================================================================================
-        // 背景
-        // ==========================================================================================================
-        const int gridSpacing = 40; // 間隔
+        // Draw a world-aligned grid down to the waterline.
+        const int gridSpacing = 40;
 
-        // 境界座標
         float worldLeft = camera.position.x - 400.0f;
         float worldRight = camera.position.x + 400.0f;
         float worldTop = camera.position.y - 300.0f;
         float worldBottom = camera.position.y + 300.0f;
 
-        // 境界座標から描画範囲を計算
+        // Snap the first grid lines to world coordinates.
         int startGridX = static_cast<int>(floorf(worldLeft / gridSpacing)) * gridSpacing;
         int startGridY = static_cast<int>(floorf(worldTop / gridSpacing)) * gridSpacing;
 
-        // 描画する
         for (int x = startGridX; x <= worldRight; x += gridSpacing) {
             Vector2 sTop = camera.WorldToScreen({ static_cast<float>(x), worldTop });
             Vector2 sBottom = camera.WorldToScreen({ static_cast<float>(x), 550.0f });
@@ -184,25 +160,12 @@ int WINAPI WinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, _
                 GetColor(30, 30, 45));
         }
 
-        // ==========================================================================================================
-        // プレイヤー・マップを描画する
-        // ==========================================================================================================
+        // Draw water last so it overlays the player and terrain.
         terrain.Draw(camera);
         player.Draw(camera, mouseWorldPos, terrain);
         water.Draw(camera);
 
-        // ==========================================================================================================
-        // UI（スコア表示）
-        // ==========================================================================================================
-        SetDrawBlendMode(DX_BLENDMODE_ALPHA, 120);
-        DrawBox(15, 15, 250, 50, GetColor(0, 0, 0), TRUE);
-        DrawBox(15, 15, 250, 50, GetColor(0, 240, 210), FALSE);
-        SetDrawBlendMode(DX_BLENDMODE_NOBLEND, 0);
-        DrawFormatString(30, 24, GetColor(255, 255, 255), "CORE COLLECTED: %06d", playerScore);
-
-        // ==========================================================================================================
-        // ゲームオーバー画面
-        // ==========================================================================================================
+        // Draw the game-over overlay.
         if (player.isDead) {
             SetDrawBlendMode(DX_BLENDMODE_ALPHA, 180);
             DrawBox(0, 0, 800, 600, GetColor(255, 255, 255), TRUE);
@@ -212,10 +175,17 @@ int WINAPI WinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, _
             DrawString(340, 330, "Press [Esc] to Quit", GetColor(255, 50, 50));
         }
 
+        // Keep the HUD readable above the game-over overlay.
+        // ゲームオーバー画面でも読めるよう、HUD はオーバーレイの上に描画する。
+        constexpr int scoreLeft = 15;
+        constexpr int scoreTop = 15;
+        constexpr int scoreRight = 250;
+        constexpr int scoreBottom = 50;
+        DrawHudPanel(scoreLeft, scoreTop, scoreRight, scoreBottom);
+        DrawFormatString(scoreLeft + 15, scoreTop + 9, GetColor(255, 255, 255), "CORE COLLECTED: %06d", playerScore);
+        controlsGuide.Draw(scoreLeft, scoreBottom + 6, scoreRight - scoreLeft, scoreBottom - scoreTop);
 
-        // ==========================================================================================================
-        // デバッグ：いろいろな情報を表示する
-        // ==========================================================================================================
+        // Optional debug display.
         //DrawString(20, 20, "[CAMERA TEST] Mouse Left: Shoot Hook anywhere | Mouse Right: Release Hook", GetColor(255, 255, 255));
         //DrawString(20, 40, "              A / D: Add Swing Force | W: Reel In | SPACE: Jump", GetColor(255, 255, 255));
         

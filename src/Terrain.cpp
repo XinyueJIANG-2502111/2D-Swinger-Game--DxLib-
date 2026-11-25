@@ -2,13 +2,43 @@
 #include "Camera.hpp"
 #include "DxLib.h"
 
+#include <cstdint>
+#include <random>
+
+namespace {
+    std::uint32_t MakeChunkSeed(int chunkX, int chunkY) {
+        // Mix both coordinate bit patterns with unsigned arithmetic.
+        std::uint64_t value =
+            (static_cast<std::uint64_t>(static_cast<std::uint32_t>(chunkX)) << 32) |
+            static_cast<std::uint32_t>(chunkY);
+
+        value += 0x9e3779b97f4a7c15ULL;
+        value = (value ^ (value >> 30)) * 0xbf58476d1ce4e5b9ULL;
+        value = (value ^ (value >> 27)) * 0x94d049bb133111ebULL;
+        value ^= value >> 31;
+
+        return static_cast<std::uint32_t>(value ^ (value >> 32));
+    }
+
+    int RandomInt(std::mt19937& engine, int minimum, int maximum) {
+        return std::uniform_int_distribution<int>(minimum, maximum)(engine);
+    }
+
+    std::mt19937& EffectRandomEngine() {
+        // Use a separate random engine for visual effects.
+        static std::mt19937 engine(std::random_device{}());
+        return engine;
+    }
+}
+
 void TerrainManager::SpawnExplosion(Vector2 spawnPos, unsigned int coreColor) {
     const int particleCount = 16;
+    std::mt19937& randomEngine = EffectRandomEngine();
+
     for (int i = 0; i < particleCount; i++) {
-        // 発散角度
-        float angle = static_cast<float>(rand() % 360) * (3.1415926f / 180.0f);
-        // 速度
-        float speed = 150.0f + static_cast<float>(rand() % 250);
+        // Pick a random direction and speed for each particle.
+        float angle = static_cast<float>(RandomInt(randomEngine, 0, 359)) * (3.1415926f / 180.0f);
+        float speed = 150.0f + static_cast<float>(RandomInt(randomEngine, 0, 249));
 
         Vector2 pVel = { std::cos(angle) * speed, std::sin(angle) * speed };
 
@@ -24,21 +54,23 @@ void TerrainManager::Init() {
     particles.clear();
     loadedChunks.clear();
 
-    // プレイヤーの足元にブロックを生成
-    obstacles.push_back({ 200.0f, 500.0f, 400.0f, 40.0f, GetColor(110, 110, 120) });
+    // Keep the spawn platform loaded when chunks unload.
+    obstacles.push_back({
+        200.0f, 500.0f, 400.0f, 40.0f,
+        GetColor(110, 110, 120),
+        0, 0, true
+    });
 }
 
 void TerrainManager::UpdateAllDirections(Vector2 cameraPos) {
-    // カメラ位置
+    // Find the camera's chunk, including negative coordinates.
     int currentCX = static_cast<int>(std::floor(cameraPos.x / CHUNK_SIZE));
     int currentCY = static_cast<int>(std::floor(cameraPos.y / CHUNK_SIZE));
 
-    // カメラを中心に周りのゾーンを探す
-    const int radius = 2;
-    for (int cx = currentCX - radius; cx <= currentCX + radius; ++cx) {
-        for (int cy = currentCY - radius; cy <= currentCY + radius; ++cy) {
+    // Load missing chunks around the camera.
+    for (int cx = currentCX - LOAD_RADIUS; cx <= currentCX + LOAD_RADIUS; ++cx) {
+        for (int cy = currentCY - LOAD_RADIUS; cy <= currentCY + LOAD_RADIUS; ++cy) {
 
-            // 生成しない場合
             if (loadedChunks.find({ cx, cy }) == loadedChunks.end()) {
                 GenerateChunk(cx, cy);
                 loadedChunks.insert({ cx, cy });
@@ -46,33 +78,44 @@ void TerrainManager::UpdateAllDirections(Vector2 cameraPos) {
         }
     }
 
-    // カメラから離れたブロックを削除する
-    float maxActiveDistance = CHUNK_SIZE * 4.0f;
-    for (auto it = obstacles.begin(); it != obstacles.end(); ) {
-        float centerX = it->x + it->width * 0.5f;
-        float centerY = it->y + it->height * 0.5f;
-        float distToCamera = std::sqrt(std::pow(centerX - cameraPos.x, 2) + std::pow(centerY - cameraPos.y, 2));
+    // Forget distant chunks so they can be generated again on return.
+    for (auto it = loadedChunks.begin(); it != loadedChunks.end(); ) {
+        const int distanceX = std::abs(it->first - currentCX);
+        const int distanceY = std::abs(it->second - currentCY);
 
-        if (distToCamera > maxActiveDistance) {
+        if (distanceX > UNLOAD_RADIUS || distanceY > UNLOAD_RADIUS) {
+            it = loadedChunks.erase(it);
+        }
+        else {
+            ++it;
+        }
+    }
+
+    // Remove obstacles owned by unloaded chunks.
+    for (auto it = obstacles.begin(); it != obstacles.end(); ) {
+        const bool ownerIsLoaded = loadedChunks.find({ it->ownerChunkX, it->ownerChunkY }) != loadedChunks.end();
+
+        if (!it->isPersistent && !ownerIsLoaded) {
             it = obstacles.erase(it);
         }
         else {
-            it++;
+            ++it;
         }
     }
 
-    // アイテムを更新
+    // Remove collected cores and cores in unloaded chunks.
     for (auto it = cores.begin(); it != cores.end(); ) {
-        float distToCamera = std::sqrt(std::pow(it->x - cameraPos.x, 2) + std::pow(it->y - cameraPos.y, 2));
-        if (distToCamera > maxActiveDistance || it->isCollected) {
+        const bool ownerIsLoaded = loadedChunks.find({ it->ownerChunkX, it->ownerChunkY }) != loadedChunks.end();
+
+        if (!ownerIsLoaded || it->isCollected) {
             it = cores.erase(it);
         }
         else {
-            it++;
+            ++it;
         }
     }
 
-    // エフェクト
+    // Advance and fade pickup particles with a fixed time step.
     const float dt = 0.008f;
     for (auto it = particles.begin(); it != particles.end(); ) {
         it->pos += it->velocity * dt;
@@ -94,31 +137,32 @@ void TerrainManager::GenerateChunk(int cx, int cy) {
     float chunkStartY = cy * CHUNK_SIZE;
     const float WATER_SURFACE_Y = 550.0f;
 
-    // 水面の下にブロックを生成しない
+    // Skip chunks that start below the waterline.
     if (chunkStartY >= WATER_SURFACE_Y) {
         return;
     }
 
-    // 乱数発生
-    unsigned int seed = std::abs(cx * 73856093 ^ cy * 19349663);
-    srand(seed);
+    // Seed each chunk from its coordinates so it regenerates the same way.
+    std::mt19937 randomEngine(MakeChunkSeed(cx, cy));
 
     float chunkStartX = cx * CHUNK_SIZE;
 
-    if (rand() % 100 < 30) return;
+    // Leave some chunks empty.
+    if (RandomInt(randomEngine, 0, 99) < 30) return;
 
-    int count = 1 + (rand() % 2);
+    int count = RandomInt(randomEngine, 1, 2);
 
     for (int i = 0; i < count; i++) {
-        // ブロックサイズ
-        float w = 80.0f + (rand() % 140);
-        float h = 30.0f + (rand() % 50);
+        float w = 80.0f + static_cast<float>(RandomInt(randomEngine, 0, 139));
+        float h = 30.0f + static_cast<float>(RandomInt(randomEngine, 0, 49));
 
-        // 位置
-        float rx = chunkStartX + (rand() % static_cast<int>(CHUNK_SIZE - w));
-        float ry = chunkStartY + (rand() % static_cast<int>(CHUNK_SIZE - h));
+        // Keep each block within its chunk.
+        const int maxOffsetX = static_cast<int>(CHUNK_SIZE - w) - 1;
+        const int maxOffsetY = static_cast<int>(CHUNK_SIZE - h) - 1;
+        float rx = chunkStartX + static_cast<float>(RandomInt(randomEngine, 0, maxOffsetX));
+        float ry = chunkStartY + static_cast<float>(RandomInt(randomEngine, 0, maxOffsetY));
 
-        // 水面下にいかないように
+        // Trim blocks at the waterline and skip very short blocks.
         if (ry + h > WATER_SURFACE_Y) {
             h = WATER_SURFACE_Y - ry - 2.0f;
             if (h < 15.0f) continue;
@@ -126,26 +170,28 @@ void TerrainManager::GenerateChunk(int cx, int cy) {
 
         unsigned int blockColor = (cy < 0) ? GetColor(140, 150, 160) : GetColor(110, 115, 100);
 
-        obstacles.push_back({ rx, ry, w, h, blockColor });
+        obstacles.push_back({ rx, ry, w, h, blockColor, cx, cy, false });
 
-        // ========================================================
-        // アイテム生成
-        // ========================================================
-        if (rand() % 100 < 60) { // 60% 確率でアイテムを生成
+        // Roll for a core above or below each block.
+        if (RandomInt(randomEngine, 0, 99) < 60) { // 60% spawn chance.
             float coreX = rx + w * 0.5f;
             float coreY = 0.0f;
 
-            if (rand() % 2 == 0) {
+            if (RandomInt(randomEngine, 0, 1) == 0) {
                 coreY = ry + h + 60.0f;
             }
             else {
                 coreY = ry - 50.0f;
             }
 
-            // 水面下に行かないように
+            // Keep cores clear of the water surface.
             if (coreY < WATER_SURFACE_Y - 20.0f) {
                 unsigned int coreColor = GetColor(250, 0, 0);
-                cores.push_back({ coreX, coreY, 12.0f, coreColor, false, static_cast<float>(rand() % 100) * 0.01f });
+                cores.push_back({
+                    coreX, coreY, 12.0f, coreColor, false,
+                    static_cast<float>(RandomInt(randomEngine, 0, 99)) * 0.01f,
+                    cx, cy
+                });
             }
         }
     }
@@ -153,7 +199,6 @@ void TerrainManager::GenerateChunk(int cx, int cy) {
 
 void TerrainManager::Draw(const Camera& camera) {
     for (const auto& obs : obstacles) {
-        // 座標変換
         Vector2 topLeft = camera.WorldToScreen({ obs.x, obs.y });
         Vector2 bottomRight = camera.WorldToScreen({ obs.x + obs.width, obs.y + obs.height });
 
@@ -162,9 +207,7 @@ void TerrainManager::Draw(const Camera& camera) {
         int x2 = static_cast<int>(bottomRight.x);
         int y2 = static_cast<int>(bottomRight.y);
 
-        // ========================================================
-        // ブロック描画
-        // ========================================================
+        // Layer outlines to give each block a glow.
         unsigned int glowColor = GetColor(0, 240, 210);
 
         SetDrawBlendMode(DX_BLENDMODE_ALPHA, 35);
@@ -185,13 +228,10 @@ void TerrainManager::Draw(const Camera& camera) {
 
     SetDrawBlendMode(DX_BLENDMODE_NOBLEND, 0);
 
-    // ========================================================
-    // アイテム描画（軽いアニメーション含む）
-    // ========================================================
+    // Draw each core with a pulsing glow.
     for (auto& core : cores) {
         if (core.isCollected) continue;
 
-        // アニメーション用
         core.pulseTimer += 0.05f;
         float pulseScale = 1.0f + std::sin(core.pulseTimer) * 0.25f;
 
@@ -213,9 +253,7 @@ void TerrainManager::Draw(const Camera& camera) {
 
     SetDrawBlendMode(DX_BLENDMODE_NOBLEND, 0);
 
-    // ========================================================
-    // エフェクト描画
-    // ========================================================
+    // Draw pickup particles.
     for (const auto& p : particles) {
         Vector2 sPartPos = camera.WorldToScreen(p.pos);
         int px = static_cast<int>(sPartPos.x);
